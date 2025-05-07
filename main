@@ -1,0 +1,205 @@
+#if UNITY_EDITOR
+using System.Collections.Generic;
+using System.Linq;
+using System.Security.Cryptography;
+using System.IO;
+using UnityEngine;
+using UnityEditor;
+
+public class ABDependencyAnalyzer : EditorWindow
+{
+    // 数据结构定义
+    class BundleNode
+    {
+        public string bundleName;
+        public HashSet<string> dependencies = new HashSet<string>();
+        public HashSet<string> referencedBy = new HashSet<string>();
+        public bool isRoot;
+        public string hash;
+    }
+
+    // 内存中存储的AB包关系图
+    private Dictionary<string, BundleNode> _bundleGraph = new Dictionary<string, BundleNode>();
+    private Dictionary<string, string> _globalHashRegistry = new Dictionary<string, string>(); // <hash, sharedBundleName>
+    
+    [MenuItem("Tools/AB Dependency Analyzer")]
+    static void Init() => GetWindow<ABDependencyAnalyzer>().Show();
+
+    void OnGUI()
+    {
+        if (GUILayout.Button("Analyze All Bundles")) 
+        {
+            AnalyzeDependencies();
+            DetectOrphanBundles();
+            GenerateSharedBundles();
+        }
+    }
+
+    // 核心分析方法
+    void AnalyzeDependencies()
+    {
+        _bundleGraph.Clear();
+        
+        // 1. 获取所有AB包及其manifest信息
+        string[] allBundles = AssetDatabase.GetAllAssetBundleNames();
+        foreach (var bundleName in allBundles)
+        {
+            BundleNode node = new BundleNode { bundleName = bundleName };
+            
+            // 获取直接依赖
+            string[] deps = AssetDatabase.GetAssetBundleDependencies(bundleName, false);
+            node.dependencies = new HashSet<string>(deps);
+            
+            // 初始化反向引用表
+            _bundleGraph[bundleName] = node;
+        }
+
+        // 2. 构建完整依赖关系图
+        foreach (var bundleName in allBundles)
+        {
+            var node = _bundleGraph[bundleName];
+            
+            // 递归获取所有传递性依赖
+            HashSet<string> allDependencies = new HashSet<string>();
+            CollectAllDependencies(bundleName, allDependencies);
+            node.dependencies = allDependencies;
+            
+            // 构建反向引用关系
+            foreach (var dep in allDependencies)
+            {
+                if (_bundleGraph.TryGetValue(dep, out BundleNode depNode))
+                {
+                    depNode.referencedBy.Add(bundleName);
+                }
+            }
+        }
+
+        // 3. 标记根节点（示例：包含场景或预制体的包）
+        foreach (var bundleName in allBundles)
+        {
+            string[] assets = AssetDatabase.GetAssetPathsFromAssetBundle(bundleName);
+            bool isRoot = assets.Any(path => 
+                path.EndsWith(".prefab") || 
+                path.EndsWith(".unity"));
+            
+            _bundleGraph[bundleName].isRoot = isRoot;
+        }
+
+        // 4. 计算每个AB包的Hash
+        foreach (var bundleName in allBundles)
+        {
+            string hash = ComputeBundleHash(bundleName);
+            _bundleGraph[bundleName].hash = hash;
+        }
+    }
+
+    // 递归收集所有传递依赖
+    void CollectAllDependencies(string current, HashSet<string> result)
+    {
+        string[] directDeps = AssetDatabase.GetAssetBundleDependencies(current, false);
+        foreach (var dep in directDeps)
+        {
+            if (result.Add(dep))
+            {
+                CollectAllDependencies(dep, result);
+            }
+        }
+    }
+
+    // 检测孤立包（拓扑排序反向标记法）
+    void DetectOrphanBundles()
+    {
+        Queue<BundleNode> queue = new Queue<BundleNode>();
+        
+        // 初始状态：所有根节点入队
+        foreach (var node in _bundleGraph.Values.Where(n => n.isRoot))
+        {
+            queue.Enqueue(node);
+        }
+
+        // 标记可达节点
+        HashSet<string> reachable = new HashSet<string>();
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            reachable.Add(current.bundleName);
+            
+            foreach (var dep in current.dependencies)
+            {
+                if (!reachable.Contains(dep))
+                {
+                    queue.Enqueue(_bundleGraph[dep]);
+                }
+            }
+        }
+
+        // 标记不可达包为可卸载
+        foreach (var bundleName in _bundleGraph.Keys)
+        {
+            if (!reachable.Contains(bundleName))
+            {
+                Debug.LogWarning($"发现孤立包: {bundleName}");
+                // 这里可以执行实际卸载操作
+                // AssetBundle.UnloadAllAssetBundles(false);
+            }
+        }
+    }
+
+    // 生成共享包（基于Hash）
+    void GenerateSharedBundes()
+    {
+        Dictionary<string, List<string>> hashGroups = new Dictionary<string, List<string>>();
+        
+        // 按Hash分组
+        foreach (var node in _bundleGraph.Values)
+        {
+            if (!hashGroups.ContainsKey(node.hash))
+            {
+                hashGroups[node.hash] = new List<string>();
+            }
+            hashGroups[node.hash].Add(node.bundleName);
+        }
+
+        // 处理重复Hash的组
+        foreach (var group in hashGroups.Where(g => g.Value.Count > 1))
+        {
+            string sharedBundleName = $"shared_{group.Key}";
+            Debug.Log($"合并重复资源: {string.Join(",", group.Value)} -> {sharedBundleName}");
+            
+            // 实际需要执行的操作：
+            // 1. 创建新的共享AB包
+            // 2. 将重复资源移动到共享包
+            // 3. 更新原始包的依赖关系
+            foreach (var originalBundle in group.Value)
+            {
+                var node = _bundleGraph[originalBundle];
+                node.dependencies.Add(sharedBundleName);
+            }
+            
+            // 记录全局Hash
+            _globalHashRegistry[group.Key] = sharedBundleName;
+        }
+    }
+
+    // 计算AB包Hash（示例：基于文件内容）
+    string ComputeBundleHash(string bundleName)
+    {
+        string path = GetBundlePath(bundleName);
+        if (!File.Exists(path)) return "";
+
+        using (var md5 = MD5.Create())
+        using (var stream = File.OpenRead(path))
+        {
+            byte[] hash = md5.ComputeHash(stream);
+            return System.BitConverter.ToString(hash);
+        }
+    }
+
+    // 获取AB包在工程中的路径
+    string GetBundlePath(string bundleName)
+    {
+        // 实际路径需要根据项目配置调整
+        return Path.Combine(Application.streamingAssetsPath, bundleName);
+    }
+}
+#endif
