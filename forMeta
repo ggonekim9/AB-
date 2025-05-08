@@ -1,0 +1,137 @@
+using UnityEditor;
+using UnityEngine;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+
+public class AssetBundleAnalyzer : EditorWindow
+{
+    private Dictionary<string, List<string>> dependencyGraph = new Dictionary<string, List<string>>();
+    private Dictionary<string, List<string>> bundleToAssets = new Dictionary<string, List<string>>();
+    private List<string> redundantAssets = new List<string>();
+    private List<List<string>> circularDependencies = new List<List<string>>();
+
+    [MenuItem("Tools/AB包分析工具")]
+    public static void ShowWindow()
+    {
+        GetWindow<AssetBundleAnalyzer>("AB包分析工具");
+    }
+
+    private void OnGUI()
+    {
+        if (GUILayout.Button("开始分析"))
+        {
+            AnalyzeAssetBundles();
+        }
+
+        // 显示分析结果
+        EditorGUILayout.LabelField("冗余资源:", redundantAssets.Count > 0 ? string.Join("\n", redundantAssets) : "无");
+        EditorGUILayout.LabelField("循环依赖:", circularDependencies.Count > 0 ? FormatCircularDependencies() : "无");
+    }
+
+    // 核心分析逻辑
+    private void AnalyzeAssetBundles()
+    {
+        dependencyGraph.Clear();
+        redundantAssets.Clear();
+        circularDependencies.Clear();
+
+        // 步骤1: 构建所有资源的 GUID 到路径的映射
+        Dictionary<string, string> guidToPath = new Dictionary<string, string>();
+        string[] allAssetPaths = AssetDatabase.GetAllAssetPaths();
+        foreach (string path in allAssetPaths)
+        {
+            string guid = AssetDatabase.AssetPathToGUID(path);
+            guidToPath[guid] = path;
+        }
+
+        // 步骤2: 构建 AB 包并获取 Manifest
+        string outputPath = Path.Combine(Application.dataPath, "../AssetBundles");
+        BuildPipeline.BuildAssetBundles(outputPath, BuildAssetBundleOptions.None, BuildTarget.StandaloneWindows);
+
+        // 步骤3: 解析 Manifest 中的依赖关系
+        AssetBundle manifestBundle = AssetBundle.LoadFromFile(Path.Combine(outputPath, "AssetBundles"));
+        AssetBundleManifest manifest = manifestBundle.LoadAsset<AssetBundleManifest>("AssetBundleManifest");
+        string[] bundles = manifest.GetAllAssetBundles();
+
+        foreach (string bundle in bundles)
+        {
+            string[] dependencies = manifest.GetAllDependencies(bundle);
+            bundleToAssets[bundle] = AssetDatabase.GetAssetPathsFromAssetBundle(bundle).ToList();
+
+            foreach (string asset in bundleToAssets[bundle])
+            {
+                string guid = AssetDatabase.AssetPathToGUID(asset);
+                dependencyGraph[guid] = new List<string>();
+
+                // 获取直接依赖的资源
+                string[] deps = AssetDatabase.GetDependencies(asset, false);
+                foreach (string dep in deps)
+                {
+                    string depGuid = AssetDatabase.AssetPathToGUID(dep);
+                    if (guid != depGuid && guidToPath.ContainsKey(depGuid))
+                    {
+                        dependencyGraph[guid].Add(depGuid);
+                    }
+                }
+            }
+        }
+
+        // 步骤4: 检测冗余资源（同一资源被打包到多个 AB 包中）
+        HashSet<string> uniqueAssets = new HashSet<string>();
+        foreach (var bundle in bundleToAssets)
+        {
+            foreach (string asset in bundle.Value)
+            {
+                string guid = AssetDatabase.AssetPathToGUID(asset);
+                if (uniqueAssets.Contains(guid))
+                {
+                    redundantAssets.Add($"{asset} (位于 {bundle.Key})");
+                }
+                else
+                {
+                    uniqueAssets.Add(guid);
+                }
+            }
+        }
+
+        // 步骤5: 检测循环依赖（简化版，实际可用图遍历算法）
+        foreach (var node in dependencyGraph)
+        {
+            List<string> path = new List<string>();
+            DetectCircularDependencies(node.Key, path);
+        }
+
+        manifestBundle.Unload(true);
+    }
+
+    // 递归检测循环依赖（深度优先搜索）
+    private void DetectCircularDependencies(string guid, List<string> path)
+    {
+        if (path.Contains(guid))
+        {
+            int index = path.IndexOf(guid);
+            circularDependencies.Add(new List<string>(path.GetRange(index, path.Count - index)));
+            return;
+        }
+
+        path.Add(guid);
+        foreach (string dep in dependencyGraph[guid])
+        {
+            DetectCircularDependencies(dep, path);
+        }
+        path.RemoveAt(path.Count - 1);
+    }
+
+    // 格式化循环依赖输出
+    private string FormatCircularDependencies()
+    {
+        List<string> results = new List<string>();
+        foreach (var cycle in circularDependencies)
+        {
+            List<string> paths = cycle.Select(guid => AssetDatabase.GUIDToAssetPath(guid)).ToList();
+            results.Add($"循环路径: {string.Join(" → ", paths)}");
+        }
+        return string.Join("\n", results.Distinct());
+    }
+}
